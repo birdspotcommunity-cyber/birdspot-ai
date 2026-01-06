@@ -25,6 +25,7 @@ async def _call_openai_with_image(image_bytes: bytes, text: str = "") -> dict:
     """
     Calls OpenAI Chat Completions with a single image + optional prompt text.
     Returns a parsed JSON dict from the assistant output.
+    If OpenAI returns non-JSON, it safely returns an "unknown" JSON object.
     """
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -63,7 +64,34 @@ async def _call_openai_with_image(image_bytes: bytes, text: str = "") -> dict:
 
     data = r.json()
     content = data["choices"][0]["message"]["content"]
-    return json.loads(content)
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Safeguard: never crash the endpoint
+        return {
+            "predictions": [
+                {
+                    "species_name": "unknown",
+                    "scientific_name": "unknown",
+                    "confidence": 0.34,
+                    "reason": "Model returned non-JSON output.",
+                },
+                {
+                    "species_name": "unknown",
+                    "scientific_name": "unknown",
+                    "confidence": 0.33,
+                    "reason": "Model returned non-JSON output.",
+                },
+                {
+                    "species_name": "unknown",
+                    "scientific_name": "unknown",
+                    "confidence": 0.33,
+                    "reason": "Model returned non-JSON output.",
+                },
+            ],
+            "notes": content[:4000],
+        }
 
 
 def _normalize_predictions(result: dict) -> dict:
@@ -118,7 +146,45 @@ async def identify_from_photo(request: Request, image: UploadFile) -> dict:
         log_usage(user_id, ip, "/api/identify/photo", key, True, OPENAI_MODEL, len(resized_bytes))
         return cached
 
-    raw = await _call_openai_with_image(resized_bytes)
+    photo_prompt = """
+You are an expert ornithologist. Identify the bird species visible in the photo.
+
+Return EXACTLY valid JSON in this format:
+
+{
+  "predictions": [
+    {
+      "species_name": "COMMON NAME (non-empty)",
+      "scientific_name": "Scientific name (non-empty if possible)",
+      "confidence": 0.0-1.0,
+      "reason": "1-2 short sentences describing visible features"
+    },
+    {
+      "species_name": "COMMON NAME (non-empty)",
+      "scientific_name": "Scientific name (non-empty if possible)",
+      "confidence": 0.0-1.0,
+      "reason": "..."
+    },
+    {
+      "species_name": "COMMON NAME (non-empty)",
+      "scientific_name": "Scientific name (non-empty if possible)",
+      "confidence": 0.0-1.0,
+      "reason": "..."
+    }
+  ],
+  "notes": "optional additional notes"
+}
+
+Rules:
+- Return exactly 3 predictions.
+- species_name MUST NOT be empty.
+- scientific_name should be provided when possible.
+- confidence must be between 0 and 1.
+- reason MUST NOT be empty.
+- Do not include any extra keys outside of this JSON object.
+"""
+
+    raw = await _call_openai_with_image(resized_bytes, photo_prompt)
     normalized = _normalize_predictions(raw)
     normalized["cached"] = False
     normalized["input_bytes"] = len(resized_bytes)
@@ -149,8 +215,7 @@ async def identify_from_audio(request: Request, audio: UploadFile) -> dict:
     # Generate bird-tuned spectrogram (Fix #2)
     spectro_png = audio_to_spectrogram_image(trimmed_wav)
 
-    # Prompt for spectrogram identification
-    prompt = """
+    sound_prompt = """
 You are an expert ornithologist.
 You are looking at a LOG-FREQUENCY spectrogram image of a bird vocalization, tuned for 800Hz–11kHz.
 
@@ -161,29 +226,44 @@ Bird calls appear as:
 - harmonics (stacked lines).
 
 Identify the most likely bird species from the pattern.
+
 Return EXACTLY valid JSON in this format:
 
 {
   "predictions": [
     {
-      "species_name": "...",
-      "scientific_name": "...",
+      "species_name": "COMMON NAME (non-empty)",
+      "scientific_name": "Scientific name (non-empty if possible)",
+      "confidence": 0.0-1.0,
+      "reason": "Describe what in the spectrogram suggests this species"
+    },
+    {
+      "species_name": "COMMON NAME (non-empty)",
+      "scientific_name": "Scientific name (non-empty if possible)",
       "confidence": 0.0-1.0,
       "reason": "..."
     },
-    ...
+    {
+      "species_name": "COMMON NAME (non-empty)",
+      "scientific_name": "Scientific name (non-empty if possible)",
+      "confidence": 0.0-1.0,
+      "reason": "..."
+    }
   ],
-  "notes": "..."
+  "notes": "optional notes about the call type, frequency range, or uncertainty"
 }
 
 Rules:
 - Return exactly 3 predictions.
+- species_name MUST NOT be empty.
+- reason MUST NOT be empty.
 - confidence must be between 0 and 1.
+- Do not include any extra keys outside of this JSON object.
 """
 
-    result = await _call_openai_with_image(spectro_png, prompt)
+    raw = await _call_openai_with_image(spectro_png, sound_prompt)
 
-    normalized = _normalize_predictions(result)
+    normalized = _normalize_predictions(raw)
     normalized["cached"] = False
     normalized["input_bytes"] = len(trimmed_wav)
 
