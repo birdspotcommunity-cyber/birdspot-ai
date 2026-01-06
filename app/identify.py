@@ -1,7 +1,10 @@
 import os
 import base64
 import json
+import tempfile
 import requests
+
+from app.openai_audio import transcribe_audio
 from fastapi import UploadFile, Request
 
 from app.prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
@@ -124,13 +127,96 @@ async def identify_from_audio(request: Request, audio: UploadFile) -> dict:
         log_usage(user_id, ip, "/api/identify/sound", key, True, OPENAI_MODEL, len(trimmed_wav))
         return cached
 
-    spectrogram_png = audio_to_spectrogram_image(trimmed_wav)
-    raw = _call_openai_with_image(spectrogram_png)
+    # Quota check
+    enforce_quota_or_raise(user_id, ip)
+
+    # 1) Save trimmed WAV to a temp file
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = os.path.join(tmpdir, "audio.wav")
+        with open(audio_path, "wb") as f:
+            f.write(trimmed_wav)
+
+        # 2) Transcribe (model "listens")
+        transcript = transcribe_audio(audio_path)
+
+    transcript = (transcript or "").strip()
+
+    # If transcription is empty, return unknown
+    if not transcript:
+        result = {
+            "predictions": [
+                {"species_id": None, "species_name": "unknown", "scientific_name": "unknown", "confidence": 0.0,
+                 "reason": "No detectable vocalization / transcription returned.", "matched_to_db": False},
+                {"species_id": None, "species_name": "unknown", "scientific_name": "unknown", "confidence": 0.0,
+                 "reason": "No detectable vocalization / transcription returned.", "matched_to_db": False},
+                {"species_id": None, "species_name": "unknown", "scientific_name": "unknown", "confidence": 0.0,
+                 "reason": "No detectable vocalization / transcription returned.", "matched_to_db": False},
+            ],
+            "notes": "Transcription was empty — audio may be silence/noise or too low volume.",
+            "cached": False,
+            "input_bytes": len(trimmed_wav),
+            "transcript": transcript,
+        }
+        cache_set(key, result)
+        log_usage(user_id, ip, "/api/identify/sound", key, False, OPENAI_MODEL, len(trimmed_wav))
+        return result
+
+    # 3) Ask the LLM to identify species from the transcription
+    prompt = f"""
+You are an expert ornithologist. Identify the bird species based on the audio transcription/description below.
+
+TRANSCRIPTION:
+{transcript}
+
+Return EXACTLY valid JSON in this format:
+{{
+  "predictions": [
+    {{
+      "species_name": "...",
+      "scientific_name": "...",
+      "confidence": 0.0-1.0,
+      "reason": "..."
+    }},
+    ...
+  ],
+  "notes": "..."
+}}
+
+Rules:
+- Return exactly 3 predictions in "predictions".
+- confidence must be a number between 0 and 1.
+- If truly uncertain, still return 3 best guesses (do not return 'unknown' unless transcript is empty).
+"""
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
+
+    data = r.json()
+    content = data["choices"][0]["message"]["content"]
+    raw = json.loads(content)
 
     normalized = _normalize_predictions(raw)
     normalized["cached"] = False
     normalized["input_bytes"] = len(trimmed_wav)
+    normalized["transcript"] = transcript
 
     cache_set(key, normalized)
     log_usage(user_id, ip, "/api/identify/sound", key, False, OPENAI_MODEL, len(trimmed_wav))
     return normalized
+
