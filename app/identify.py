@@ -129,96 +129,54 @@ async def identify_from_audio(request: Request, audio: UploadFile) -> dict:
         log_usage(user_id, ip, "/api/identify/sound", key, True, OPENAI_MODEL, len(trimmed_wav))
         return cached
 
-    # Quota check
+    # Quota enforcement
     enforce_user_quota(request)
 
-    # 1) Save trimmed WAV to a temp file
-    with tempfile.TemporaryDirectory() as tmpdir:
-        audio_path = os.path.join(tmpdir, "audio.wav")
-        with open(audio_path, "wb") as f:
-            f.write(trimmed_wav)
+    # Generate bird-tuned spectrogram (Fix #2)
+    spectro_png = audio_to_spectrogram_image(trimmed_wav)
 
-        # 2) Transcribe (model "listens")
-        transcript = transcribe_audio(audio_path)
+    # Prompt for spectrogram identification
+    prompt = """
+You are an expert ornithologist.
+You are looking at a LOG-FREQUENCY spectrogram image of a bird vocalization, tuned for 800Hz–11kHz.
 
-    transcript = (transcript or "").strip()
+Bird calls appear as:
+- whistles (smooth lines),
+- trills (rapid repeated lines),
+- chirps (short bursts),
+- harmonics (stacked lines).
 
-    # If transcription is empty, return unknown
-    if not transcript:
-        result = {
-            "predictions": [
-                {"species_id": None, "species_name": "unknown", "scientific_name": "unknown", "confidence": 0.0,
-                 "reason": "No detectable vocalization / transcription returned.", "matched_to_db": False},
-                {"species_id": None, "species_name": "unknown", "scientific_name": "unknown", "confidence": 0.0,
-                 "reason": "No detectable vocalization / transcription returned.", "matched_to_db": False},
-                {"species_id": None, "species_name": "unknown", "scientific_name": "unknown", "confidence": 0.0,
-                 "reason": "No detectable vocalization / transcription returned.", "matched_to_db": False},
-            ],
-            "notes": "Transcription was empty — audio may be silence/noise or too low volume.",
-            "cached": False,
-            "input_bytes": len(trimmed_wav),
-            "transcript": transcript,
-        }
-        cache_set(key, result)
-        log_usage(user_id, ip, "/api/identify/sound", key, False, OPENAI_MODEL, len(trimmed_wav))
-        return result
-
-    # 3) Ask the LLM to identify species from the transcription
-    prompt = f"""
-You are an expert ornithologist. Identify the bird species based on the audio transcription/description below.
-
-TRANSCRIPTION:
-{transcript}
-
+Identify the most likely bird species from the pattern.
 Return EXACTLY valid JSON in this format:
-{{
+
+{
   "predictions": [
-    {{
+    {
       "species_name": "...",
       "scientific_name": "...",
       "confidence": 0.0-1.0,
       "reason": "..."
-    }},
+    },
     ...
   ],
   "notes": "..."
-}}
+}
 
 Rules:
-- Return exactly 3 predictions in "predictions".
-- confidence must be a number between 0 and 1.
-- If truly uncertain, still return 3 best guesses (do not return 'unknown' unless transcript is empty).
+- Return exactly 3 predictions.
+- confidence must be between 0 and 1.
 """
 
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.2,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
-        "response_format": {"type": "json_object"}
-    }
+    # Call OpenAI with image
+    result = await _call_openai_with_image(
+        prompt=prompt,
+        image_bytes=spectro_png
+    )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
-
-    data = r.json()
-    content = data["choices"][0]["message"]["content"]
-    raw = json.loads(content)
-
-    normalized = _normalize_predictions(raw)
+    normalized = _normalize_predictions(result)
     normalized["cached"] = False
     normalized["input_bytes"] = len(trimmed_wav)
-    normalized["transcript"] = transcript
 
     cache_set(key, normalized)
     log_usage(user_id, ip, "/api/identify/sound", key, False, OPENAI_MODEL, len(trimmed_wav))
     return normalized
-
