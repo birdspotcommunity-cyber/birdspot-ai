@@ -1,13 +1,11 @@
 import os
 import base64
 import json
-import tempfile
 import requests
 
-from app.openai_audio import transcribe_audio
 from fastapi import UploadFile, Request
 
-from app.prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
+from app.prompts import SYSTEM_PROMPT
 from app.cache import sha256_bytes, cache_get, cache_set
 from app.spectrogram import audio_to_spectrogram_image
 from app.species import match_species
@@ -15,35 +13,48 @@ from app.media_utils import resize_image, trim_audio
 from app.usage_db import log_usage
 from app.quotas import enforce_user_quota
 
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
-def _call_openai_with_image(image_bytes: bytes) -> dict:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
 
+
+async def _call_openai_with_image(image_bytes: bytes, text: str = "") -> dict:
+    """
+    Calls OpenAI Chat Completions with a single image + optional prompt text.
+    Returns a parsed JSON dict from the assistant output.
+    """
     b64 = base64.b64encode(image_bytes).decode("utf-8")
-    image_url = f"data:image/png;base64,{b64}"
+
+    if not text:
+        text = "Identify the bird species in this image and return JSON."
 
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": USER_PROMPT_TEMPLATE},
-                {"type": "image_url", "image_url": {"url": image_url}}
-            ]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64}"
+                        },
+                    },
+                ],
+            },
         ],
-        "response_format": {"type": "json_object"}
+        "response_format": {"type": "json_object"},
     }
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=60)
@@ -53,6 +64,7 @@ def _call_openai_with_image(image_bytes: bytes) -> dict:
     data = r.json()
     content = data["choices"][0]["message"]["content"]
     return json.loads(content)
+
 
 def _normalize_predictions(result: dict) -> dict:
     preds = result.get("predictions", [])
@@ -90,6 +102,7 @@ def _normalize_predictions(result: dict) -> dict:
         "notes": result.get("notes", "")
     }
 
+
 async def identify_from_photo(request: Request, image: UploadFile) -> dict:
     raw_bytes = await image.read()
     resized_bytes = resize_image(raw_bytes)
@@ -105,7 +118,7 @@ async def identify_from_photo(request: Request, image: UploadFile) -> dict:
         log_usage(user_id, ip, "/api/identify/photo", key, True, OPENAI_MODEL, len(resized_bytes))
         return cached
 
-    raw = _call_openai_with_image(resized_bytes)
+    raw = await _call_openai_with_image(resized_bytes)
     normalized = _normalize_predictions(raw)
     normalized["cached"] = False
     normalized["input_bytes"] = len(resized_bytes)
@@ -113,6 +126,7 @@ async def identify_from_photo(request: Request, image: UploadFile) -> dict:
     cache_set(key, normalized)
     log_usage(user_id, ip, "/api/identify/photo", key, False, OPENAI_MODEL, len(resized_bytes))
     return normalized
+
 
 async def identify_from_audio(request: Request, audio: UploadFile) -> dict:
     raw_bytes = await audio.read()
@@ -167,7 +181,6 @@ Rules:
 - confidence must be between 0 and 1.
 """
 
-    # Call OpenAI with image
     result = await _call_openai_with_image(spectro_png, prompt)
 
     normalized = _normalize_predictions(result)
