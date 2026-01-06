@@ -168,10 +168,7 @@ Rules:
 """
 
     # Call OpenAI with image
-    result = await _call_openai_with_image(
-        prompt=prompt,
-        image_bytes=spectro_png
-    )
+    result = await _call_openai_with_image(spectro_png, prompt)
 
     normalized = _normalize_predictions(result)
     normalized["cached"] = False
