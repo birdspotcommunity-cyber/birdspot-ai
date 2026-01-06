@@ -13,6 +13,8 @@ from app.spectrogram import audio_to_spectrogram_image
 from app.species import match_species
 from app.media_utils import resize_image, trim_audio
 from app.usage_db import log_usage
+from app.quotas import enforce_user_quota
+
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -128,7 +130,7 @@ async def identify_from_audio(request: Request, audio: UploadFile) -> dict:
         return cached
 
     # Quota check
-    enforce_quota_or_raise(user_id, ip)
+    enforce_user_quota(request)
 
     # 1) Save trimmed WAV to a temp file
     with tempfile.TemporaryDirectory() as tmpdir:
