@@ -125,10 +125,17 @@ def _normalize_predictions(result: dict) -> dict:
             "matched_to_db": False
         })
 
-    return {
+    # Keep existing response fields
+    out = {
         "predictions": normalized,
         "notes": result.get("notes", "")
     }
+
+    # NEW: include analysis when the model returns it (sound prompt)
+    if isinstance(result.get("analysis"), dict):
+        out["analysis"] = result["analysis"]
+
+    return out
 
 
 async def identify_from_photo(request: Request, image: UploadFile) -> dict:
@@ -216,26 +223,35 @@ async def identify_from_audio(request: Request, audio: UploadFile) -> dict:
     spectro_png = audio_to_spectrogram_image(trimmed_wav)
 
     sound_prompt = """
-You are an expert ornithologist.
+You are an expert ornithologist and bioacoustics specialist.
+
 You are looking at a LOG-FREQUENCY spectrogram image of a bird vocalization, tuned for 800Hz–11kHz.
 
-Bird calls appear as:
-- whistles (smooth lines),
-- trills (rapid repeated lines),
-- chirps (short bursts),
-- harmonics (stacked lines).
+Before choosing species, analyze these spectrogram features:
+- frequency range (approximate low and high in Hz)
+- call type (whistle / trill / chirp / complex song)
+- repetition rate (slow / medium / rapid)
+- presence of harmonics (none / weak / strong)
+- note shape (rising / falling / flat / repeated syllables / multi-part)
 
-Identify the most likely bird species from the pattern.
+Then choose the 3 most likely bird species.
 
 Return EXACTLY valid JSON in this format:
 
 {
+  "analysis": {
+    "freq_range_hz": "e.g. 1500-6500",
+    "call_type": "whistle/trill/chirp/song",
+    "repetition_rate": "slow/medium/rapid",
+    "harmonics": "none/weak/strong",
+    "shape_summary": "one short sentence"
+  },
   "predictions": [
     {
       "species_name": "COMMON NAME (non-empty)",
       "scientific_name": "Scientific name (non-empty if possible)",
       "confidence": 0.0-1.0,
-      "reason": "Describe what in the spectrogram suggests this species"
+      "reason": "One sentence linking spectrogram features to this species"
     },
     {
       "species_name": "COMMON NAME (non-empty)",
@@ -250,7 +266,7 @@ Return EXACTLY valid JSON in this format:
       "reason": "..."
     }
   ],
-  "notes": "optional notes about the call type, frequency range, or uncertainty"
+  "notes": "optional"
 }
 
 Rules:
@@ -258,6 +274,8 @@ Rules:
 - species_name MUST NOT be empty.
 - reason MUST NOT be empty.
 - confidence must be between 0 and 1.
+- If uncertain, do NOT assign confidence above 0.5.
+- Only use confidence > 0.7 if the pattern is extremely distinctive.
 - Do not include any extra keys outside of this JSON object.
 """
 
